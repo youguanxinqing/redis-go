@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	logger "github.com/sirupsen/logrus"
 	"io"
@@ -17,17 +18,53 @@ type Payload struct {
 	Err  error
 }
 
+// ParseStream reads from io.Reader and send Payload though channel
+func ParseStream(reader io.Reader) chan<- *Payload {
+	ch := make(chan *Payload)
+	go parse0(reader, ch)
+	return ch
+}
+
+func ParseBytes(data []byte) ([]redis.Reply, error) {
+	ch := make(chan *Payload)
+	reader := bytes.NewReader(data)
+	go parse0(reader, ch)
+
+	var results []redis.Reply
+	for payload := range ch {
+		if payload.Err != nil {
+			if payload.Err == io.EOF {
+				break
+			}
+			return nil, payload.Err
+		}
+		results = append(results, payload.Data)
+	}
+	return results, nil
+}
+
+func ParseOne(data []byte) (redis.Reply, error) {
+	ch := make(chan *Payload)
+	reader := bytes.NewReader(data)
+	go parse0(reader, ch)
+
+	payload, ok := <-ch
+	if !ok {
+		return nil, errors.New("no reply")
+	}
+	return payload.Data, payload.Err
+}
+
 type readState struct {
-	downloading       bool
+	readingMultiLine  bool
 	expectedArgsCount int
-	receivedCount     int
 	msgType           byte
 	args              [][]byte
-	fixedLen          int64
+	bulkLen           int64
 }
 
 func (s *readState) finished() bool {
-	return s.expectedArgsCount > 0 && s.expectedArgsCount == s.receivedCount
+	return s.expectedArgsCount > 0 && s.expectedArgsCount == len(s.args)
 }
 
 // parse0 解析客户端协议
@@ -73,20 +110,71 @@ func parse0(reader io.Reader, ch chan<- *Payload) {
 			- 字符串：以 $ 开始
 			- 数组：以 * 开始
 		*/
-		if !state.downloading {
+		if !state.readingMultiLine {
 			switch msg[0] {
 			case '*': // multi bulk reply
+				err = parseMultiBulkHeader(msg, &state)
+				if err != nil {
+					ch <- &Payload{
+						Err: err,
+					}
+					state = readState{} // reset state
+					continue
+				}
+				if state.expectedArgsCount == 0 {
+					ch <- &Payload{
+						Data: &reply.EmptyMultiBulkReply{},
+					}
+					state = readState{}
+					continue
+				}
 			case '$': // bulk reply
+				err = parseBulkHeader(msg, &state)
+				if err != nil {
+					ch <- &Payload{
+						Err: err,
+					}
+					state = readState{}
+					continue
+				}
+				if state.bulkLen == -1 {
+					ch <- &Payload{
+						Data: &reply.NullBulkReply{},
+					}
+					state = readState{}
+					continue
+				}
 			default: // single line reply
 				result, err := parseSingleLineReply(msg)
 				ch <- &Payload{
 					Data: result,
 					Err:  err,
 				}
+				state = readState{}
 				continue
 			}
-		} else {
-
+		} else { // receive following bulk reply
+			err = readBody(msg, &state)
+			if err != nil {
+				ch <- &Payload{
+					Err: err,
+				}
+				state = readState{}
+				continue
+			}
+			if state.finished() {
+				var result redis.Reply
+				if state.msgType == '*' {
+					result = reply.MakeMultiBulkReply(state.args)
+				} else if state.msgType == '$' {
+					result = reply.MakeBulkReply(state.args[0])
+				}
+				ch <- &Payload{
+					Data: result,
+					Err:  err,
+				}
+				state = readState{}
+			}
 		}
 	}
 }
@@ -101,8 +189,7 @@ func readLine(bufReader *bufio.Reader, state *readState) ([]byte, bool, error) {
 		msg []byte
 		err error
 	)
-
-	if state.fixedLen == 0 {
+	if state.bulkLen == 0 {
 		msg, err = bufReader.ReadBytes('\n')
 		if err != nil { // read normal line
 			return nil, true, err
@@ -112,7 +199,7 @@ func readLine(bufReader *bufio.Reader, state *readState) ([]byte, bool, error) {
 			return nil, false, errors.New("protocol error: " + string(msg))
 		}
 	} else { // read bulk line (binary safe)
-		msg = make([]byte, state.fixedLen+2)
+		msg = make([]byte, state.bulkLen+2)
 		_, err = io.ReadFull(bufReader, msg)
 		if err != nil {
 			return nil, true, err
@@ -122,7 +209,7 @@ func readLine(bufReader *bufio.Reader, state *readState) ([]byte, bool, error) {
 			msg[len(msg)-1] == '\n' {
 			return nil, false, errors.New("protocol error: " + string(msg))
 		}
-		state.fixedLen = 0
+		state.bulkLen = 0
 	}
 
 	return msg, false, nil
@@ -157,4 +244,62 @@ func parseSingleLineReply(msg []byte) (redis.Reply, error) {
 		result = reply.MakeMultiBulkReply(args)
 	}
 	return result, nil
+}
+
+//- 数组以"*"开头, "*3"表示数组中有 3 个元素
+func parseMultiBulkHeader(msg []byte, state *readState) error {
+	var (
+		err          error
+		expectedLine uint64
+	)
+	expectedLine, err = strconv.ParseUint(string(msg[1:len(msg)-2]), 10, 32)
+	if err != nil || expectedLine < 0 {
+		return errors.New("protocol error: " + string(msg))
+	}
+	state.expectedArgsCount = int(expectedLine)
+	if expectedLine > 0 {
+		state.msgType = msg[0]
+		state.readingMultiLine = true
+		state.args = make([][]byte, 0, expectedLine)
+	}
+	return nil
+}
+
+//- 字符串(Bulk String)以"$"开头,
+//- "$1"表示 nil, 例如 get 命令查询一个不存在的 key 时,返回 $1
+func parseBulkHeader(msg []byte, state *readState) error {
+	var err error
+	state.bulkLen, err = strconv.ParseInt(string(msg[1:len(msg)-2]), 10, 64)
+	if err != nil {
+		return errors.New("protocol error: " + string(msg))
+	}
+	if state.bulkLen == -1 { // null bulk
+		return nil
+	} else if state.bulkLen > 0 {
+		state.msgType = msg[0]
+		state.readingMultiLine = true
+		state.expectedArgsCount = 1
+		state.args = make([][]byte, 0, 1)
+		return nil
+	} else {
+		return errors.New("protocol error: " + string(msg))
+	}
+}
+
+func readBody(msg []byte, state *readState) error {
+	line := msg[0 : len(msg)-1]
+	var err error
+	if line[0] == '$' {
+		state.bulkLen, err = strconv.ParseInt(string(line[1:]), 10, 64)
+		if err != nil {
+			return errors.New("protocol error: " + string(msg))
+		}
+		if state.bulkLen <= 0 { // null bulk only in multi bulks
+			state.args = append(state.args, []byte{})
+			state.bulkLen = 0
+		}
+	} else {
+		state.args = append(state.args, line)
+	}
+	return nil
 }

@@ -13,6 +13,29 @@ var (
 
 ///////////////////////// Bulk Reply /////////////////////////
 
+/*
+
+$3
+foo
+
+*/
+type BulkReply struct {
+	Arg []byte
+}
+
+func MakeBulkReply(arg []byte) *BulkReply {
+	return &BulkReply{
+		Arg: arg,
+	}
+}
+
+func (r *BulkReply) ToBytes() []byte {
+	if len(r.Arg) == 0 {
+		return nullBulkReplyBytes
+	}
+	return []byte("$" + strconv.Itoa(len(r.Arg)) + CRLF + string(r.Arg) + CRLF)
+}
+
 ///////////////////////// Multi Bulk Reply /////////////////////////
 
 /*
