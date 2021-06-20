@@ -48,8 +48,8 @@ func ParseOne(data []byte) (redis.Reply, error) {
 	reader := bytes.NewReader(data)
 	go parse0(reader, ch)
 
-	payload, ok := <-ch
-	if !ok {
+	payload := <-ch
+	if payload == nil {
 		return nil, errors.New("no reply")
 	}
 	return payload.Data, payload.Err
